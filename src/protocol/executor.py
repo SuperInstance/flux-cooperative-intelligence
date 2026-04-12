@@ -306,6 +306,7 @@ class DCSExecutor:
     """
 
     MAX_RETRIES = 3
+    MAX_COLLECT_RETRIES = 1  # retry once for missing results in Phase 4
     MAX_VERIFICATION_LOOPS = 3
     PHASE_TIMEOUT = 300.0  # seconds per phase
 
@@ -340,9 +341,40 @@ class DCSExecutor:
         session_start = time.time()
         self.session_log = SessionLog(problem_id="")
 
+        # Edge case: empty agents list
+        if not self.agents:
+            total_time = time.time() - session_start
+            self.session_log.total_time = total_time
+            self.session_log.success = False
+            return CooperativeSolution(
+                answer=None,
+                confidence=0.0,
+                methodology="No agents available for cooperative solving.",
+                total_time=total_time,
+                problem_id="",
+            )
+
         try:
             # Phase 1: Decompose
             manifest = self._phase1_decompose(problem_statement, owner_id)
+
+            # Edge case: zero sub-problems produced by decomposition
+            if not manifest.sub_problems:
+                total_time = time.time() - session_start
+                self.session_log.problem_id = manifest.problem_id
+                self.session_log.phases_completed.append("decompose")
+                self.session_log.total_time = total_time
+                self.session_log.success = True
+                # Skip to synthesis with empty partials
+                answer, confidence, methodology, conflicts = self._phase5_synthesize([])
+                return CooperativeSolution(
+                    answer=answer,
+                    confidence=confidence,
+                    methodology=f"No sub-problems decomposed. {methodology}",
+                    agent_contributions={},
+                    total_time=total_time,
+                    problem_id=manifest.problem_id,
+                )
             self.session_log.problem_id = manifest.problem_id
 
             # Phase 2: Self-Select
@@ -353,7 +385,32 @@ class DCSExecutor:
             partial_results = self._phase3_execute(manifest, assignments)
 
             # Phase 4: Collect (already done in Phase 3, but formally collect)
-            results = self._phase4_collect(partial_results, manifest)
+            # Retry logic: if results are missing, attempt retry
+            results = self._phase4_collect(partial_results, manifest, attempt=0)
+
+            # Edge case: all agents failed — return best-effort result
+            if not results and manifest.sub_problems:
+                total_time = time.time() - session_start
+                self.session_log.total_time = total_time
+                self.session_log.success = False
+                # Collect whatever partial/failed info we have for a best-effort answer
+                failed_summaries = []
+                for sp in manifest.sub_problems:
+                    status = sp.status.value if sp.status else "unknown"
+                    failed_summaries.append(f"{sp.id} ({status})")
+                reduced_confidence = 0.1
+                return CooperativeSolution(
+                    answer=None,
+                    confidence=reduced_confidence,
+                    methodology=(
+                        f"All agents failed during execution. "
+                        f"Sub-problems: {', '.join(failed_summaries)}. "
+                        f"Best-effort result with reduced confidence."
+                    ),
+                    agent_contributions={},
+                    total_time=total_time,
+                    problem_id=manifest.problem_id,
+                )
 
             # Phase 5: Synthesize
             answer, confidence, methodology, conflicts = self._phase5_synthesize(results)
@@ -496,25 +553,120 @@ class DCSExecutor:
         self,
         results: List[PartialResult],
         manifest: ProblemManifest,
+        attempt: int = 0,
     ) -> List[PartialResult]:
         """Phase 4: Result Collection.
 
-        Checks completeness and identifies gaps. In a production system,
-        this would handle retries for missing results.
+        Checks completeness and identifies gaps. If results are missing
+        and this is not a retry, attempts one retry with remaining agents.
         """
         solved_ids = {r.sub_problem_id for r in results}
         all_ids = {sp.id for sp in manifest.sub_problems}
 
         gaps = all_ids - solved_ids
         if gaps:
-            # Log gaps — in production, would retry
+            if attempt < self.MAX_COLLECT_RETRIES:
+                # Attempt retry: re-execute gap sub-problems with available agents
+                retry_results = self._retry_missing_results(gaps, manifest, results)
+                if retry_results:
+                    self.session_log.retry_count += 1
+                    results.extend(retry_results)
+                    # Re-collect to check if all gaps are now filled
+                    return self._phase4_collect(results, manifest, attempt=attempt + 1)
+
+            # Still have gaps after retry — mark them as yielded
             for gap_id in gaps:
-                sp = next((s for s in manifest.sub_problems if s.id == gap_id), None)
+                sp = next(
+                    (s for s in manifest.sub_problems if s.id == gap_id), None
+                )
                 if sp:
                     sp.status = SubProblemStatus.YIELDED
 
         self.session_log.phases_completed.append("collect")
         return results
+
+    def _retry_missing_results(
+        self,
+        gap_ids: Set[str],
+        manifest: ProblemManifest,
+        existing_results: List[PartialResult],
+    ) -> List[PartialResult]:
+        """Attempt to re-execute missing sub-problems with remaining agents.
+
+        For each gap, find an agent that hasn't failed that sub-problem yet
+        and try to solve it.
+        """
+        agent_map = {
+            a.agent_id: a
+            for a in self.agents
+            if hasattr(a, "agent_id") and hasattr(a, "solve")
+        }
+        # Find agents that already have results
+        failed_agent_sp: Dict[str, Set[str]] = {}
+        for r in existing_results:
+            failed_agent_sp.setdefault(r.agent_id, set())
+        # Track which agents failed which sub-problems
+        for sp in manifest.sub_problems:
+            if sp.status == SubProblemStatus.FAILED and sp.assigned_agent:
+                failed_agent_sp.setdefault(sp.assigned_agent, set()).add(sp.id)
+
+        retry_results: List[PartialResult] = []
+
+        for gap_id in gap_ids:
+            sp = next(
+                (s for s in manifest.sub_problems if s.id == gap_id), None
+            )
+            if not sp:
+                continue
+
+            # Find an agent that hasn't tried this sub-problem yet
+            used_agents = {
+                sp.assigned_agent
+            } if sp.assigned_agent else set()
+            used_agents.update(
+                aid
+                for aid, failed_sps in failed_agent_sp.items()
+                if gap_id in failed_sps
+            )
+
+            # Try available agents (prefer those with matching capabilities)
+            best_agent = None
+            best_score = -1.0
+
+            for agent_id, agent in agent_map.items():
+                if agent_id in used_agents:
+                    continue
+                # Score by capability overlap
+                overlap = len(agent.capabilities & sp.capabilities_needed)
+                coverage = overlap / max(len(sp.capabilities_needed), 1)
+                if coverage > best_score:
+                    best_score = coverage
+                    best_agent = agent
+
+            if best_agent is None:
+                # No agent available for retry
+                continue
+
+            sp.assigned_agent = best_agent.agent_id
+            sp.status = SubProblemStatus.IN_PROGRESS
+
+            try:
+                start = time.time()
+                result = best_agent.solve(sp)
+                result.sub_problem_id = sp.id
+                result.agent_id = best_agent.agent_id
+                result.elapsed_time = time.time() - start
+                # Reduce confidence for retried results
+                result.confidence = max(result.confidence * 0.8, 0.1)
+                sp.result = result
+                sp.status = SubProblemStatus.COMPLETED
+                retry_results.append(result)
+            except Exception:
+                sp.status = SubProblemStatus.FAILED
+                failed_agent_sp.setdefault(best_agent.agent_id, set()).add(sp.id)
+                self.session_log.yields_received.append(sp.id)
+
+        return retry_results
 
     def _phase5_synthesize(
         self, results: List[PartialResult]

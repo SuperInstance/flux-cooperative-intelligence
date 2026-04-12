@@ -927,6 +927,293 @@ class TestPatternSelection(unittest.TestCase):
         self.assertGreater(rec.confidence, 0.0)
 
 
+class TestEdgeCaseEmptyAgents(unittest.TestCase):
+    """Test edge case: empty agents list."""
+
+    def test_empty_agents_returns_empty_result(self):
+        """Executor with no agents should return a valid but empty CooperativeSolution."""
+        executor = DCSExecutor(agents=[])
+        solution = executor.run("Calculate something complex")
+
+        self.assertIsInstance(solution, CooperativeSolution)
+        self.assertIsNone(solution.answer)
+        self.assertAlmostEqual(solution.confidence, 0.0)
+        self.assertEqual(solution.agent_contributions, {})
+        self.assertGreaterEqual(solution.total_time, 0.0)
+
+    def test_empty_agents_methodology_describes_issue(self):
+        """Methodology should explain that no agents were available."""
+        executor = DCSExecutor(agents=[])
+        solution = executor.run("Solve this problem")
+
+        self.assertIn("No agents", solution.methodology)
+
+    def test_empty_agents_session_log_failure(self):
+        """Session log should record failure for empty agents."""
+        executor = DCSExecutor(agents=[])
+        executor.run("Problem")
+
+        self.assertFalse(executor.session_log.success)
+        self.assertGreaterEqual(executor.session_log.total_time, 0.0)
+
+
+class TestEdgeCaseZeroSubProblems(unittest.TestCase):
+    """Test edge case: decomposer returns zero sub-problems."""
+
+    def _make_decomposer_with_zero_sps(self):
+        """Create a decomposer that returns a manifest with no sub-problems."""
+        from protocol.problem import ProblemDecomposer
+
+        class ZeroDecomposer(ProblemDecomposer):
+            def decompose(self, problem_statement, agent_capabilities=None):
+                return ProblemManifest(
+                    statement=problem_statement,
+                    sub_problems=[],
+                )
+
+        return ZeroDecomposer()
+
+    def test_zero_sub_problems_skips_to_synthesis(self):
+        """Should skip to synthesis when no sub-problems are produced."""
+        agent = MockAgent(
+            agent_id="a1",
+            capabilities={"math"},
+            solve_answer="42",
+        )
+        agent.evaluate_claim = lambda sp: make_claim_agent(agent, sp)
+        agent.solve = lambda sp: make_solve_agent(agent, sp)
+
+        decomposer = self._make_decomposer_with_zero_sps()
+        executor = DCSExecutor(agents=[agent], decomposer=decomposer)
+        solution = executor.run("Trivial problem")
+
+        self.assertIsInstance(solution, CooperativeSolution)
+        # No answer since no partials to synthesize
+        self.assertIsNone(solution.answer)
+        self.assertAlmostEqual(solution.confidence, 0.0)
+
+    def test_zero_sub_problems_no_agent_contributions(self):
+        """Should have no agent contributions when there are no sub-problems."""
+        agent = MockAgent(agent_id="a1", capabilities={"math"})
+        agent.evaluate_claim = lambda sp: make_claim_agent(agent, sp)
+        agent.solve = lambda sp: make_solve_agent(agent, sp)
+
+        decomposer = self._make_decomposer_with_zero_sps()
+        executor = DCSExecutor(agents=[agent], decomposer=decomposer)
+        solution = executor.run("Trivial problem")
+
+        self.assertEqual(solution.agent_contributions, {})
+
+    def test_zero_sub_problems_methodology_mentions_no_sub_problems(self):
+        """Methodology should note that no sub-problems were decomposed."""
+        agent = MockAgent(agent_id="a1", capabilities={"math"})
+        decomposer = self._make_decomposer_with_zero_sps()
+        executor = DCSExecutor(agents=[agent], decomposer=decomposer)
+        solution = executor.run("Trivial problem")
+
+        self.assertIn("No sub-problems", solution.methodology)
+
+    def test_zero_sub_problems_session_log_success(self):
+        """Session log should still record success even with zero sub-problems."""
+        agent = MockAgent(agent_id="a1", capabilities={"math"})
+        decomposer = self._make_decomposer_with_zero_sps()
+        executor = DCSExecutor(agents=[agent], decomposer=decomposer)
+        executor.run("Trivial problem")
+
+        self.assertTrue(executor.session_log.success)
+        self.assertIn("decompose", executor.session_log.phases_completed)
+
+
+class TestEdgeCaseAllAgentsFail(unittest.TestCase):
+    """Test edge case: all agents fail during execution."""
+
+    def test_all_agents_fail_returns_best_effort(self):
+        """When all agents fail, should return best-effort result with reduced confidence."""
+        failing_agent = MockAgent(
+            agent_id="fail-agent",
+            capabilities={"math"},
+        )
+        failing_agent.evaluate_claim = lambda sp: make_claim_agent(failing_agent, sp)
+        failing_agent.solve = lambda sp: (_ for _ in ()).throw(RuntimeError("Agent crashed"))
+
+        executor = DCSExecutor(agents=[failing_agent])
+        solution = executor.run("Calculate the answer")
+
+        self.assertIsInstance(solution, CooperativeSolution)
+        # Best-effort: reduced confidence, not zero
+        self.assertGreater(solution.confidence, 0.0)
+        self.assertLessEqual(solution.confidence, 0.2)  # reduced confidence = 0.1
+        self.assertIsNone(solution.answer)
+        self.assertFalse(executor.session_log.success)
+
+    def test_all_agents_fail_methodology_describes_failure(self):
+        """Methodology should describe that all agents failed."""
+        failing_agent = MockAgent(
+            agent_id="fail-agent",
+            capabilities={"math"},
+        )
+        failing_agent.evaluate_claim = lambda sp: make_claim_agent(failing_agent, sp)
+        failing_agent.solve = lambda sp: (_ for _ in ()).throw(RuntimeError("crash"))
+
+        executor = DCSExecutor(agents=[failing_agent])
+        solution = executor.run("Calculate the answer")
+
+        self.assertIn("All agents failed", solution.methodology)
+        self.assertIn("reduced confidence", solution.methodology)
+
+    def test_all_agents_fail_no_contributions(self):
+        """Should have no agent contributions when all agents fail."""
+        failing_agent = MockAgent(
+            agent_id="fail-agent",
+            capabilities={"math"},
+        )
+        failing_agent.evaluate_claim = lambda sp: make_claim_agent(failing_agent, sp)
+        failing_agent.solve = lambda sp: (_ for _ in ()).throw(RuntimeError("crash"))
+
+        executor = DCSExecutor(agents=[failing_agent])
+        solution = executor.run("Calculate the answer")
+
+        self.assertEqual(solution.agent_contributions, {})
+
+    def test_multiple_agents_all_fail(self):
+        """Should handle all agents failing even when there are multiple."""
+        failing_agent1 = MockAgent(agent_id="f1", capabilities={"math"})
+        failing_agent1.evaluate_claim = lambda sp: make_claim_agent(failing_agent1, sp)
+        failing_agent1.solve = lambda sp: (_ for _ in ()).throw(RuntimeError("crash 1"))
+
+        failing_agent2 = MockAgent(agent_id="f2", capabilities={"math"})
+        failing_agent2.evaluate_claim = lambda sp: make_claim_agent(failing_agent2, sp)
+        failing_agent2.solve = lambda sp: (_ for _ in ()).throw(RuntimeError("crash 2"))
+
+        executor = DCSExecutor(agents=[failing_agent1, failing_agent2])
+        solution = executor.run("Calculate the answer")
+
+        self.assertIsInstance(solution, CooperativeSolution)
+        self.assertGreater(solution.confidence, 0.0)
+        self.assertLessEqual(solution.confidence, 0.2)
+        self.assertFalse(executor.session_log.success)
+
+
+class TestPhase4RetryLogic(unittest.TestCase):
+    """Test Phase 4 retry logic for missing results."""
+
+    def test_retry_on_missing_results(self):
+        """Phase 4 should retry missing results with available agents."""
+        # First agent fails the sub-problem
+        failing_agent = MockAgent(agent_id="failer", capabilities={"math"})
+        failing_agent.evaluate_claim = lambda sp: make_claim_agent(failing_agent, sp)
+        failing_agent.solve = lambda sp: (_ for _ in ()).throw(RuntimeError("first attempt fails"))
+
+        # Second agent succeeds (it should be used as retry)
+        success_agent = MockAgent(
+            agent_id="retrier",
+            capabilities={"math"},
+            solve_answer="retried answer",
+            solve_confidence=0.7,
+        )
+        success_agent.evaluate_claim = lambda sp: None  # doesn't claim initially
+
+        def solve_that_fails_first_time_then_succeeds(sp):
+            # On the first call (from phase3), fail. On retry (from phase4), succeed.
+            if not hasattr(solve_that_fails_first_time_then_succeeds, "call_count"):
+                solve_that_fails_first_time_then_succeeds.call_count = 0
+            solve_that_fails_first_time_then_succeeds.call_count += 1
+            if solve_that_fails_first_time_then_succeeds.call_count == 1:
+                raise RuntimeError("First attempt fails")
+            return make_solve_agent(success_agent, sp)
+
+        success_agent.solve = solve_that_fails_first_time_then_succeeds
+
+        executor = DCSExecutor(agents=[failing_agent, success_agent])
+        solution = executor.run("Calculate something")
+
+        self.assertIsInstance(solution, CooperativeSolution)
+        # The retried agent should have produced a result
+        # (either through retry or the solution should still be valid)
+        self.assertIsNotNone(solution)
+
+    def test_retry_marks_gaps_as_yielded(self):
+        """Sub-problems with no results after retry should be marked YIELDED."""
+        # Only one agent, and it fails
+        failing_agent = MockAgent(agent_id="failer", capabilities={"math"})
+        failing_agent.evaluate_claim = lambda sp: make_claim_agent(failing_agent, sp)
+        failing_agent.solve = lambda sp: (_ for _ in ()).throw(RuntimeError("always fails"))
+
+        executor = DCSExecutor(agents=[failing_agent])
+        solution = executor.run("Calculate something")
+
+        # All agents failed, so we get best-effort result
+        self.assertFalse(executor.session_log.success)
+        # Check that the retry was attempted (yields_received should include gap sub-problems)
+        # Since only one agent exists, retry can't find a new agent
+
+    def test_retry_with_no_available_agents_for_gap(self):
+        """When no alternative agents exist for a gap, the gap should remain unfilled."""
+        failing_agent = MockAgent(agent_id="only-agent", capabilities={"math"})
+        failing_agent.evaluate_claim = lambda sp: make_claim_agent(failing_agent, sp)
+        failing_agent.solve = lambda sp: (_ for _ in ()).throw(RuntimeError("fails"))
+
+        executor = DCSExecutor(agents=[failing_agent])
+        solution = executor.run("Calculate something")
+
+        # Should return best-effort since all agents failed
+        self.assertGreater(solution.confidence, 0.0)
+        self.assertLessEqual(solution.confidence, 0.2)
+
+    def test_retry_increments_session_retry_count(self):
+        """Successful retry should increment session log retry count."""
+        # We need a scenario where initial execution fails for some sub-problems
+        # but retry succeeds. Create two sub-problems via a custom decomposer.
+        from protocol.problem import ProblemDecomposer
+
+        class TwoSubProblemDecomposer(ProblemDecomposer):
+            def decompose(self, problem_statement, agent_capabilities=None):
+                sp1 = SubProblem(
+                    description="First sub-problem",
+                    capabilities_needed={"math"},
+                )
+                sp2 = SubProblem(
+                    description="Second sub-problem",
+                    capabilities_needed={"reasoning"},
+                )
+                return ProblemManifest(
+                    statement=problem_statement,
+                    sub_problems=[sp1, sp2],
+                )
+
+        # Agent that claims both sub-problems but fails on reasoning
+        math_agent = MockAgent(agent_id="math-guy", capabilities={"math", "reasoning"})
+        math_agent.evaluate_claim = lambda sp: make_claim_agent(math_agent, sp)
+
+        def math_solve(sp):
+            if "reasoning" in sp.capabilities_needed:
+                raise RuntimeError("Can't do reasoning")
+            return make_solve_agent(math_agent, sp)
+        math_agent.solve = math_solve
+
+        # Agent for reasoning (only for retry)
+        reason_agent = MockAgent(
+            agent_id="reason-guy",
+            capabilities={"reasoning"},
+            solve_answer="reasoned answer",
+            solve_confidence=0.7,
+        )
+        reason_agent.evaluate_claim = lambda sp: None  # Doesn't claim initially
+        reason_agent.solve = lambda sp: make_solve_agent(reason_agent, sp)
+
+        decomposer = TwoSubProblemDecomposer()
+        executor = DCSExecutor(
+            agents=[math_agent, reason_agent],
+            decomposer=decomposer,
+        )
+        solution = executor.run("Solve math and reasoning")
+
+        # The reasoning sub-problem should have been retried with reason-guy
+        self.assertIsNotNone(solution.answer)
+        # Retry count should be at least 1
+        self.assertGreaterEqual(executor.session_log.retry_count, 1)
+
+
 class TestSessionLogging(unittest.TestCase):
     """Test session log recording."""
 

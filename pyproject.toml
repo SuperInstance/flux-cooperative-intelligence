@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flux-cooperative-intelligence"
+version = "0.1.0"
+description = "FLUX Cooperative Intelligence Compiler — translates high-level cooperative programs into FLUX bytecode via A2A opcodes"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

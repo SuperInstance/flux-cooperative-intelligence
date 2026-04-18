@@ -329,6 +329,8 @@ class ProblemDecomposer:
           share capabilities.
         - A sub-problem with broader capabilities may depend on more
           specialized sub-problems.
+        - Cycles are detected and broken by removing the edge that would
+          create the cycle.
 
         Args:
             sub_problems: List to analyze.
@@ -338,11 +340,48 @@ class ProblemDecomposer:
         """
         self._identify_dependencies(sub_problems)
 
+        # Detect and break cycles
+        self._detect_and_break_cycles(sub_problems)
+
         graph: Dict[str, List[str]] = {}
         for sp in sub_problems:
             graph[sp.id] = list(sp.dependencies)
 
         return graph
+
+    def has_cycle(self, sub_problems: List[SubProblem]) -> bool:
+        """Check whether the dependency graph contains a cycle.
+
+        Args:
+            sub_problems: List of sub-problems to check.
+
+        Returns:
+            True if a cycle exists, False otherwise.
+        """
+        graph: Dict[str, List[str]] = {}
+        for sp in sub_problems:
+            graph[sp.id] = list(sp.dependencies)
+
+        visited: Set[str] = set()
+        rec_stack: Set[str] = set()
+
+        def dfs(node: str) -> bool:
+            visited.add(node)
+            rec_stack.add(node)
+            for neighbor in graph.get(node, []):
+                if neighbor not in visited:
+                    if dfs(neighbor):
+                        return True
+                elif neighbor in rec_stack:
+                    return True
+            rec_stack.discard(node)
+            return False
+
+        for sp in sub_problems:
+            if sp.id not in visited:
+                if dfs(sp.id):
+                    return True
+        return False
 
     def suggest_assignment(
         self,
@@ -586,6 +625,61 @@ class ProblemDecomposer:
                 if other_order < sp_order and j < i:
                     if other.id not in sp.dependencies:
                         sp.dependencies.append(other.id)
+
+    def _detect_and_break_cycles(
+        self, sub_problems: List[SubProblem]
+    ) -> None:
+        """Detect cycles in the dependency graph and break them.
+
+        Uses iterative DFS to find back-edges and removes the dependency
+        that would close the cycle (the last edge in the cycle).
+        """
+        id_to_sp: Dict[str, SubProblem] = {sp.id: sp for sp in sub_problems}
+
+        max_iterations = len(sub_problems) + 1  # Safety bound
+        for _ in range(max_iterations):
+            # Build adjacency list
+            graph: Dict[str, List[str]] = {}
+            for sp in sub_problems:
+                graph[sp.id] = list(sp.dependencies)
+
+            # DFS cycle detection
+            visited: Set[str] = set()
+            rec_stack: Set[str] = set()
+            cycle_edge: Optional[Tuple[str, str]] = None
+
+            def _dfs(node: str) -> bool:
+                nonlocal cycle_edge
+                visited.add(node)
+                rec_stack.add(node)
+                for neighbor in graph.get(node, []):
+                    if neighbor not in id_to_sp:
+                        continue  # Skip dangling references
+                    if neighbor not in visited:
+                        if _dfs(neighbor):
+                            return True
+                    elif neighbor in rec_stack:
+                        cycle_edge = (node, neighbor)
+                        return True
+                rec_stack.discard(node)
+                return False
+
+            has_cycle = False
+            for sp in sub_problems:
+                if sp.id not in visited:
+                    if _dfs(sp.id):
+                        has_cycle = True
+                        break
+
+            if not has_cycle or cycle_edge is None:
+                break
+
+            # Break the cycle by removing the edge (from -> to)
+            from_id, to_id = cycle_edge
+            if from_id in id_to_sp:
+                sp = id_to_sp[from_id]
+                if to_id in sp.dependencies:
+                    sp.dependencies.remove(to_id)
 
     def _tailor_to_agents(
         self,
